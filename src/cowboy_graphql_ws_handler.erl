@@ -23,6 +23,7 @@
 -export_type([
     protocol/0,
     config/0,
+    options/0,
     features/0
 ]).
 

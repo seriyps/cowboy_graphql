@@ -130,7 +130,8 @@ subscription_case(Cfg) when is_list(Cfg) ->
     F = atom_to_binary(?FUNCTION_NAME),
     Cli = client("/api/ok--pubsub/websocket", proto(Cfg)),
     Resp = request(Cli, <<"subscribe">>, F, #{<<"k">> => <<"v">>}),
-    % request/4 is asynchronous
+    %% TODO: better synchronization, request/4 is asynchronous
+    timer:sleep(300),
     ok = cowboy_graphql_mock:sync(),
     ?assertEqual(
         #{

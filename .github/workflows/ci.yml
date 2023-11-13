@@ -1,0 +1,47 @@
+name: CI
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+jobs:
+  ci:
+    name: Run checks and tests over ${{matrix.otp}} and ${{matrix.os}}
+    runs-on: ${{matrix.os}}
+    container:
+      image: erlang:${{ matrix.otp }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        otp: ["26.0", "25.3", "24.3"]
+        os: ["ubuntu-22.04"]
+        include:
+          - otp: "23.3"
+            os: "ubuntu-20.04"
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Compile
+        run: rebar3 compile
+
+      - name: xref
+        run: rebar3 xref
+
+      - name: Erlfmt
+        run: rebar3 fmt --check
+
+      - name: Common test
+        run: rebar3 ct -c
+
+      - name: Test coverage
+        run: rebar3 cover --verbose -m 75
+
+      - name: Generate docs
+        run: rebar3 edoc
+
+      - name: Dialyze
+        run: rebar3 dialyzer
