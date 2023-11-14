@@ -218,9 +218,9 @@ execute(#state{cb = Callback, cb_state = CallbackState0} = St0) ->
         Callback, #{}, TransportInfo, CallbackState0
     ),
     {St1, Payload} = parse_payload(HttpMethod, PayloadLocation, St0),
-    {OpName, Doc, Vars} = decode(Payload, St1),
+    {OpName, Doc, Vars, Ext} = decode(Payload, St1),
     Id = <<"1">>,
-    case cowboy_graphql:call_handle_request(Callback, Id, OpName, Doc, Vars, #{}, CallbackState1) of
+    case cowboy_graphql:call_handle_request(Callback, Id, OpName, Doc, Vars, Ext, CallbackState1) of
         {noreply, CallbackState2} ->
             %% TODO: long-polling
             %% https://ninenines.eu/docs/en/cowboy/2.9/guide/loop_handlers/
@@ -303,15 +303,15 @@ parse_payload(post, json, #state{req = Req0, opts = #{max_body_size := MaxSize}}
 decode(#{<<"query">> := Doc} = Data, St) when is_binary(Doc) ->
     Vars = maps:get(<<"variables">>, Data, #{}),
     OpName = maps:get(<<"operationName">>, Data, undefined),
+    Extensions = maps:get(<<"extensions">>, Data, #{}),
     DocStr = unicode:characters_to_list(Doc),
-    VarsMap =
-        case is_binary(Vars) of
-            true ->
-                json_decode(Vars, St);
-            false when is_map(Vars) ->
-                Vars
-        end,
-    {OpName, DocStr, VarsMap};
+    ParseMap = fun
+        (V) when is_binary(V) ->
+            json_decode(V, St);
+        (V) when is_map(V) ->
+            V
+    end,
+    {OpName, DocStr, ParseMap(Vars), ParseMap(Extensions)};
 decode(_, St) ->
     throw(
         err(

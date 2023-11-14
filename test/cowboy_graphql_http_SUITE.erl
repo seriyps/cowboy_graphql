@@ -80,7 +80,8 @@ echo_case(Cfg) when is_list(Cfg) ->
                 "/api/ok--",
                 <<"echo">>,
                 <<"graphql query">>,
-                #{<<"k">> => <<"v">>}
+                #{<<"k">> => <<"v">>},
+                #{<<"ek">> => <<"ev">>}
             )
         ),
     ?assertEqual(<<"application/json">>, proplists:get_value(<<"content-type">>, Hdrs)),
@@ -88,7 +89,7 @@ echo_case(Cfg) when is_list(Cfg) ->
         #{
             <<"data">> =>
                 #{
-                    <<"extensions">> => #{},
+                    <<"extensions">> => #{<<"ek">> => <<"ev">>},
                     <<"query">> => <<"graphql query">>,
                     <<"vars">> => #{<<"k">> => <<"v">>}
                 }
@@ -304,38 +305,55 @@ r(Reader) ->
 enc(Cfg) ->
     lists:foldl(fun proplists:get_value/2, Cfg, [tc_group_properties, name]).
 
-request(C, post_json, Path, Operation, Query, Vars) ->
+request(C, Format, Path, Op, Query, Vars) ->
+    request(C, Format, Path, Op, Query, Vars, null).
+
+request(C, post_json, Path, Operation, Query, Vars, Extensions) ->
     Headers = [
         {<<"Content-Type">>, <<"application/json">>},
         {<<"Accept">>, <<"application/json">>}
     ],
-    Body = jsx:encode(#{
-        <<"operationName">> => Operation,
-        <<"query">> => Query,
-        <<"variables">> => Vars
-    }),
+    Body = jsx:encode(
+        preprocess(
+            [
+                {<<"operationName">>, Operation},
+                {<<"query">>, Query},
+                {<<"variables">>, Vars},
+                {<<"extensions">>, Extensions}
+            ],
+            fun(V) -> V end
+        )
+    ),
     http_post_path(Path, Headers, Body, C);
-request(C, post_form, Path, Operation, Query, Vars) ->
+request(C, post_form, Path, Operation, Query, Vars, Extensions) ->
     Headers = [
         {<<"Content-Type">>, <<"application/x-www-form-urlencoded">>},
         {<<"Accept">>, <<"application/json">>}
     ],
     Body = cow_qs:qs(
-        [
-            {<<"operationName">>, Operation},
-            {<<"query">>, Query},
-            {<<"variables">>, jsx:encode(Vars)}
-        ]
+        preprocess(
+            [
+                {<<"operationName">>, Operation},
+                {<<"query">>, Query},
+                {<<"variables">>, jsx:encode(Vars)},
+                {<<"extensions">>, Extensions}
+            ],
+            fun jsx:encode/1
+        )
     ),
     http_post_path(Path, Headers, Body, C);
-request(C, get_qs, Path, Operation, Query, Vars) ->
+request(C, get_qs, Path, Operation, Query, Vars, Extensions) ->
     Headers = [{<<"Accept">>, <<"application/json">>}],
     QS = cow_qs:qs(
-        [
-            {<<"operationName">>, Operation},
-            {<<"query">>, Query},
-            {<<"variables">>, jsx:encode(Vars)}
-        ]
+        preprocess(
+            [
+                {<<"operationName">>, Operation},
+                {<<"query">>, Query},
+                {<<"variables">>, jsx:encode(Vars)},
+                {<<"extensions">>, Extensions}
+            ],
+            fun jsx:encode/1
+        )
     ),
     FullPath = iolist_to_binary([Path, $?, QS]),
     http_get_path(FullPath, Headers, C).
@@ -356,3 +374,12 @@ http_await_with_json_body(Pid, Stream) ->
             {ok, Body} = gun:await_body(Pid, Stream),
             {Status, Headers, jsx:decode(Body)}
     end.
+
+preprocess([{_K, null} | KV], MapEncoder) ->
+    preprocess(KV, MapEncoder);
+preprocess([{K, V} | KV], MapEncoder) when is_map(V) ->
+    [{K, MapEncoder(V)} | preprocess(KV, MapEncoder)];
+preprocess([{K, V} | KV], MapEncoder) when is_binary(V) ->
+    [{K, V} | preprocess(KV, MapEncoder)];
+preprocess([], _) ->
+    [].
