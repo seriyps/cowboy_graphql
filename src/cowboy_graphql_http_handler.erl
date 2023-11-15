@@ -7,10 +7,11 @@
 
 -module(cowboy_graphql_http_handler).
 
--behaviour(cowboy_handler).
+%% -behaviour(cowboy_handler).
+-behaviour(cowboy_loop).
 
 -export([config/3]).
--export([init/2, terminate/3]).
+-export([init/2, info/3, terminate/3]).
 % private
 -export([format_error/2]).
 -export_type([
@@ -60,6 +61,8 @@
     post => <<"POST">>
 }).
 
+-define(REQ_ID, <<"1">>).
+
 -spec config(module(), any(), options()) -> config().
 config(Callback, CallbackOptions, TransportOptions) ->
     {Callback, CallbackOptions, TransportOptions}.
@@ -100,6 +103,52 @@ init(Req, {Callback, CallbackOpts, Params0}) ->
             do(Req, Callback, CbState, Params)
     end.
 
+info(Msg, Req0, #state{cb = Callback, cb_state = CallbackState0} = St) ->
+    case cowboy_graphql:call_handle_info(Callback, Msg, CallbackState0) of
+        {noreply, CallbackState} ->
+            {ok, Req0, St#state{cb_state = CallbackState}};
+        {reply, {?REQ_ID, Done, Data, Errors, Extensions}, CallbackState1} ->
+            Result0 = cowboy_graphql:put_not_empty(<<"data">>, Data, #{}),
+            Result1 = cowboy_graphql:put_not_empty(<<"extensions">>, Extensions, Result0),
+            Result = cowboy_graphql:put_not_empty(<<"errors">>, Errors, Result1),
+            CallbackState =
+                case Done of
+                    true ->
+                        CallbackState1;
+                    false ->
+                        {noreply, CallbackState_} = cowboy_graphql:call_handle_cancel(
+                            Callback, ?REQ_ID, CallbackState1
+                        ),
+                        CallbackState_
+                end,
+            Req = cowboy_req:reply(
+                200,
+                #{<<"content-type">> => <<"application/json">>},
+                json_encode(Result, St),
+                Req0
+            ),
+            {stop, Req, St#state{cb_state = CallbackState}};
+        {error, Err, CallbackState} ->
+            ?LOG_INFO(
+                #{
+                    label => callback_error,
+                    function => handle_info,
+                    module => Callback,
+                    reason => Err
+                },
+                #{domain => ?LOG_DOMAIN}
+            ),
+            {Code, ResBody} = format_error([request_error, other_error], Err),
+            {stop,
+                cowboy_req:reply(
+                    Code,
+                    #{<<"content-type">> => <<"application/json">>},
+                    json_encode(ResBody, St),
+                    Req0
+                ),
+                St#state{cb_state = CallbackState}}
+    end.
+
 do(
     Req0,
     Callback,
@@ -133,7 +182,9 @@ do(
     try execute(St0) of
         {ok, ResBody, #state{req = Req1} = St1} ->
             ?LOG_DEBUG(#{tag => graphql_success, result => ResBody}, #{domain => ?LOG_DOMAIN}),
-            {ok, cowboy_req:reply(200, RespHeaders, json_encode(ResBody, St1), Req1), St1}
+            {ok, cowboy_req:reply(200, RespHeaders, json_encode(ResBody, St1), Req1), St1};
+        {loop, #state{req = Req1} = St1} ->
+            {cowboy_loop, Req1, St1}
     catch
         throw:{callback, #state{req = Req1} = St1, Error} ->
             %% Error returned from callback module
@@ -219,15 +270,12 @@ execute(#state{cb = Callback, cb_state = CallbackState0} = St0) ->
     ),
     {St1, Payload} = parse_payload(HttpMethod, PayloadLocation, St0),
     {OpName, Doc, Vars, Ext} = decode(Payload, St1),
-    Id = <<"1">>,
+    Id = ?REQ_ID,
     case cowboy_graphql:call_handle_request(Callback, Id, OpName, Doc, Vars, Ext, CallbackState1) of
-        {noreply, CallbackState2} ->
+        {noreply, CallbackState} ->
             %% TODO: long-polling
             %% https://ninenines.eu/docs/en/cowboy/2.9/guide/loop_handlers/
-            {noreply, CallbackState} = cowboy_graphql:call_handle_cancel(
-                Callback, Id, CallbackState2
-            ),
-            {[], St1#state{cb_state = CallbackState}};
+            {loop, St1#state{cb_state = CallbackState}};
         {reply, {Id, true, Data, Errors, Extensions}, CallbackState} ->
             Result0 = cowboy_graphql:put_not_empty(<<"data">>, Data, #{}),
             Result1 = cowboy_graphql:put_not_empty(<<"extensions">>, Extensions, Result0),

@@ -12,6 +12,7 @@
 -export([
     echo_case/1,
     subscription_case/1,
+    subscription_request_error_case/1,
     graphql_error_case/1,
     handle_request_validation_error_case/1,
     handle_request_other_error_case/1,
@@ -101,7 +102,7 @@ graphql_error_case({post, Cfg}) ->
     Cfg;
 graphql_error_case(Cfg) when is_list(Cfg) ->
     Cli = client("/api/ok--/websocket", proto(Cfg)),
-    Payload = r(request(Cli, <<"error-graphql">>, <<"graphql query">>, #{<<"k">> => <<"v">>})),
+    Payload = r(request(Cli, <<"data-and-errors">>, <<"graphql query">>, #{<<"k">> => <<"v">>})),
     ?assertEqual(
         #{
             <<"data">> =>
@@ -132,7 +133,7 @@ subscription_case(Cfg) when is_list(Cfg) ->
     Resp = request(Cli, <<"subscribe">>, F, #{<<"k">> => <<"v">>}),
     %% TODO: better synchronization, request/4 is asynchronous
     timer:sleep(300),
-    ok = cowboy_graphql_mock:sync(),
+    ok = cowboy_graphql_mock:sync(?FUNCTION_NAME),
     ?assertEqual(
         #{
             <<"data">> =>
@@ -142,7 +143,7 @@ subscription_case(Cfg) when is_list(Cfg) ->
                     <<"vars">> => #{<<"k">> => <<"v">>}
                 }
         },
-        pubsub(Resp)
+        pubsub(Resp, ?FUNCTION_NAME, false)
     ),
     ?assertEqual(
         #{
@@ -153,9 +154,37 @@ subscription_case(Cfg) when is_list(Cfg) ->
                     <<"vars">> => #{<<"k">> => <<"v">>}
                 }
         },
-        pubsub(Resp)
+        pubsub(Resp, ?FUNCTION_NAME, false)
     ),
     cancel(Cli, Resp),
+    close(Cli).
+
+%% @doc Subscription returned `error' from `handle_info'
+subscription_request_error_case({pre, Cfg}) ->
+    Cfg;
+subscription_request_error_case({post, Cfg}) ->
+    Cfg;
+subscription_request_error_case(Cfg) when is_list(Cfg) ->
+    F = atom_to_binary(?FUNCTION_NAME),
+    Cli = client("/api/ok--pubsub/websocket", proto(Cfg)),
+    Resp = request(Cli, <<"subscribe">>, F, #{<<"k">> => <<"v">>}),
+    %% TODO: better synchronization, request/6 is asynchronous
+    timer:sleep(300),
+    ok = cowboy_graphql_mock:sync(?FUNCTION_NAME),
+    Payload = pubsub_error(Resp, ?FUNCTION_NAME, <<"err msg">>),
+    ?assertEqual(
+        [
+            #{
+                <<"extensions">> => #{
+                    <<"exts">> => #{},
+                    <<"query">> => F,
+                    <<"vars">> => #{<<"k">> => <<"v">>}
+                },
+                <<"message">> => <<"err msg">>
+            }
+        ],
+        Payload
+    ),
     close(Cli).
 
 %% @doc `handle_request' callback returns `request_validation_error' error
@@ -468,18 +497,27 @@ r({ReqId, apollo, Await}) ->
     }} = Await(),
     Payload.
 
-pubsub({ReqId, graphql_ws, Await}) ->
-    ok = cowboy_graphql_mock:publish(ReqId),
+pubsub({ReqId, graphql_ws, Await}, Conn, Done) ->
+    ok = cowboy_graphql_mock:publish(Conn, ReqId, Done),
     {ok, #{
         <<"type">> := <<"next">>,
         <<"id">> := ReqId,
         <<"payload">> := Payload
     }} = Await(),
     Payload;
-pubsub({ReqId, apollo, Await}) ->
-    ok = cowboy_graphql_mock:publish(ReqId),
+pubsub({ReqId, apollo, Await}, Conn, Done) ->
+    ok = cowboy_graphql_mock:publish(Conn, ReqId, Done),
     {ok, #{
         <<"type">> := <<"data">>,
+        <<"id">> := ReqId,
+        <<"payload">> := Payload
+    }} = Await(),
+    Payload.
+
+pubsub_error({ReqId, _, Await}, Conn, Msg) ->
+    ok = cowboy_graphql_mock:publish_request_error(Conn, ReqId, Msg),
+    {ok, #{
+        <<"type">> := <<"error">>,
         <<"id">> := ReqId,
         <<"payload">> := Payload
     }} = Await(),

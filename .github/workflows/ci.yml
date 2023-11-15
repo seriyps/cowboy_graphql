@@ -38,7 +38,7 @@ jobs:
         run: rebar3 ct -c
 
       - name: Test coverage
-        run: rebar3 cover --verbose -m 75
+        run: rebar3 cover --verbose -m 80
 
       - name: Generate docs
         run: rebar3 edoc

@@ -12,6 +12,9 @@
 -export([
     echo_case/1,
     graphql_error_case/1,
+    subscription_case/1,
+    subscription_autocancel_case/1,
+    subscription_request_error_case/1,
     handle_request_validation_error_case/1,
     handle_request_other_error_case/1,
     handle_request_crash_case/1,
@@ -111,7 +114,7 @@ graphql_error_case(Cfg) when is_list(Cfg) ->
                 Cli,
                 enc(Cfg),
                 "/api/ok--",
-                <<"error-graphql">>,
+                <<"data-and-errors">>,
                 <<"graphql query">>,
                 #{<<"k">> => <<"v">>}
             )
@@ -136,6 +139,90 @@ graphql_error_case(Cfg) when is_list(Cfg) ->
         Payload
     ),
     ok.
+
+%% @doc Subscription over HTTP with long-polling (only one response allowed)
+subscription_case({pre, Cfg}) ->
+    Cfg;
+subscription_case({post, Cfg}) ->
+    Cfg;
+subscription_case(Cfg) when is_list(Cfg) ->
+    F = atom_to_binary(?FUNCTION_NAME),
+    Cli = client(),
+    Resp = request(Cli, enc(Cfg), "/api/ok--pubsub", <<"subscribe">>, F, #{<<"k">> => <<"v">>}),
+    %% TODO: better synchronization, request/6 is asynchronous
+    timer:sleep(300),
+    ok = cowboy_graphql_mock:sync(?FUNCTION_NAME),
+    {200, Hdrs, Payload} = pubsub(?FUNCTION_NAME, Resp, true),
+    ?assertEqual(<<"application/json">>, proplists:get_value(<<"content-type">>, Hdrs)),
+    ?assertEqual(
+        #{
+            <<"data">> =>
+                #{
+                    <<"extensions">> => #{},
+                    <<"query">> => <<"subscription_case">>,
+                    <<"vars">> => #{<<"k">> => <<"v">>}
+                }
+        },
+        Payload
+    ).
+
+%% @doc Subscription over HTTP with long-polling - it is ok to return `Done = false'
+%% When `Done = false', the `handle_cancel' callback will be called.
+subscription_autocancel_case({pre, Cfg}) ->
+    Cfg;
+subscription_autocancel_case({post, Cfg}) ->
+    Cfg;
+subscription_autocancel_case(Cfg) when is_list(Cfg) ->
+    F = atom_to_binary(?FUNCTION_NAME),
+    Cli = client(),
+    Resp = request(Cli, enc(Cfg), "/api/ok--pubsub", <<"subscribe">>, F, #{<<"k">> => <<"v">>}),
+    %% TODO: better synchronization, request/6 is asynchronous
+    timer:sleep(300),
+    ok = cowboy_graphql_mock:sync(?FUNCTION_NAME),
+    {200, Hdrs, Payload} = pubsub(?FUNCTION_NAME, Resp, false),
+    ?assertEqual(<<"application/json">>, proplists:get_value(<<"content-type">>, Hdrs)),
+    ?assertEqual(
+        #{
+            <<"data">> =>
+                #{
+                    <<"extensions">> => #{},
+                    <<"query">> => <<"subscription_autocancel_case">>,
+                    <<"vars">> => #{<<"k">> => <<"v">>}
+                }
+        },
+        Payload
+    ).
+
+%% @doc Subscription returned `error' from `handle_info'
+subscription_request_error_case({pre, Cfg}) ->
+    Cfg;
+subscription_request_error_case({post, Cfg}) ->
+    Cfg;
+subscription_request_error_case(Cfg) when is_list(Cfg) ->
+    F = atom_to_binary(?FUNCTION_NAME),
+    Cli = client(),
+    Resp = request(Cli, enc(Cfg), "/api/ok--pubsub", <<"subscribe">>, F, #{<<"k">> => <<"v">>}),
+    %% TODO: better synchronization, request/6 is asynchronous
+    timer:sleep(300),
+    ok = cowboy_graphql_mock:sync(?FUNCTION_NAME),
+    {200, Hdrs, Payload} = pubsub_error(?FUNCTION_NAME, Resp, <<"err msg">>),
+    ?assertEqual(<<"application/json">>, proplists:get_value(<<"content-type">>, Hdrs)),
+    ?assertEqual(
+        #{
+            <<"errors">> =>
+                [
+                    #{
+                        <<"extensions">> => #{
+                            <<"exts">> => #{},
+                            <<"query">> => F,
+                            <<"vars">> => #{<<"k">> => <<"v">>}
+                        },
+                        <<"message">> => <<"err msg">>
+                    }
+                ]
+        },
+        Payload
+    ).
 
 %% @doc `handle_request' callback returns `request_validation_error' error
 handle_request_validation_error_case({pre, Cfg}) ->
@@ -374,6 +461,14 @@ http_await_with_json_body(Pid, Stream) ->
             {ok, Body} = gun:await_body(Pid, Stream),
             {Status, Headers, jsx:decode(Body)}
     end.
+
+pubsub(Proc, Await, Done) ->
+    ok = cowboy_graphql_mock:publish(Proc, <<"1">>, Done),
+    Await().
+
+pubsub_error(Proc, Await, Msg) ->
+    ok = cowboy_graphql_mock:publish_request_error(Proc, <<"1">>, Msg),
+    Await().
 
 preprocess([{_K, null} | KV], MapEncoder) ->
     preprocess(KV, MapEncoder);

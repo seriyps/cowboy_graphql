@@ -6,8 +6,8 @@ Generic graphql HTTP and websocket transports for Cowboy.
 It supports following transport protocols:
 
 * HTTP POST application/x-www-form-urlencoded
-* HTTP POST application/json
-* HTTP GET with data passed as URL query string
+* HTTP [POST application/json](https://github.com/graphql/graphql-over-http/blob/main/spec/GraphQLOverHTTP.md#post)
+* HTTP [GET with data passed as URL query string](https://github.com/graphql/graphql-over-http/blob/main/spec/GraphQLOverHTTP.md#get)
 * WebSocket [graphql_ws](https://github.com/enisdenjo/graphql-ws/blob/master/PROTOCOL.md)
 * WebSocket [apollo](https://github.com/apollographql/subscriptions-transport-ws/blob/master/PROTOCOL.md)
 
@@ -19,9 +19,10 @@ The idea is to define a `cowboy_graphql` behaviour callback module and the same 
 any transport protocol.
 
 
-Callback modules
+Callback module
 -----
 
+The `cowboy_graphql` behaviour module have to implement following callbacks.
 
 ### `connection`
 
@@ -79,10 +80,15 @@ handle_request(
 Is called when GraphQL query or subscription is received (for HTTP - we read and parse body,
 for WebSocket - when `Subscribe` message received).
 
+The actual GraphQL request should be parsed, validated and executed here.
+
 This callback may either:
 * return the result immediately
-* initiate the subscription (storing the `request_id()` as correlation key) and return the results
-  from `handle_info`
+* initiate the subscription or execute request asynchronously (storing the `request_id()` as
+  correlation key) and return the result(s) from `handle_info`
+
+The `Done` flag of the `result()` signals whether the query is done producing results (should be
+always `true` for `query` and `mutation`) or more results could be produced (for `subscription`).
 
 ### `handle_cancel`
 
@@ -92,7 +98,7 @@ handle_cancel(Id :: binary(), handler_state()) ->
     | {error, other_error(), handler_state()}.
 ```
 
-Is called when client requested the subscription cancellation (for HTTP - does not happen,
+Is called when client requested the subscription cancellation (for HTTP - see `handle_info`,
 for WebSocket - when client sends `Complete`).
 
 ### `handle_info`
@@ -107,6 +113,11 @@ handle_info(Msg :: any(), State :: handler_state()) ->
 
 Is called when the Erlang process that represents the connection receives regular messages from
 other processes (eg, from pub-sub system).
+
+**For HTTP transport** `reply` or `error` can be returned only once. If the `result()` has
+`Done` flag set to `false`, `handle_cancel/2` will be called immediately for HTTP.
+But we may add streaming over [SSE](https://html.spec.whatwg.org/multipage/server-sent-events.html)
+later (if client signals `Accept: text/event-stream`).
 
 ### `terminate`
 

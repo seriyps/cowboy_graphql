@@ -1,7 +1,7 @@
 -module(cowboy_graphql_mock).
 -behaviour(cowboy_graphql).
 
--export([start/1, stop/0, port/0, publish/1, sync/0]).
+-export([start/1, stop/0, port/0, publish/3, publish_request_error/3, sync/1]).
 
 -export([connection/2, init/3, handle_request/6, handle_cancel/2, handle_info/2, terminate/2]).
 
@@ -32,9 +32,8 @@ routes(ws) ->
 stop() ->
     cowboy:stop_listener(?MODULE).
 
-publish(Id) ->
-    [Conn] = ranch:procs(?MODULE, connections),
-    Conn ! {publish, self(), Id},
+publish(Conn, Id, Done) ->
+    whereis(Conn) ! {?FUNCTION_NAME, self(), Id, Done},
     receive
         {ack, Id} ->
             ok
@@ -42,13 +41,24 @@ publish(Id) ->
         error(timeout)
     end.
 
-sync() ->
-    [Conn] = ranch:procs(?MODULE, connections),
-    Ref = erlang:make_ref(),
-    Conn ! {sync, self(), Ref},
+publish_request_error(Conn, Id, Msg) ->
+    whereis(Conn) ! {?FUNCTION_NAME, self(), Id, Msg},
+    receive
+        {ack, Id} ->
+            ok
+    after 5000 ->
+        error(timeout)
+    end.
+
+sync(Conn) ->
+    Ref = erlang:monitor(process, Conn),
+    whereis(Conn) ! {sync, self(), Ref},
     receive
         {sync, Ref} ->
-            ok
+            erlang:demonitor(Ref),
+            ok;
+        Other ->
+            error({bad_msg, Other})
     after 5000 ->
         error(timeout)
     end.
@@ -72,6 +82,8 @@ init(#{}, TransportInfo, #state{} = St) ->
     {ok, #{}, St#state{transport_info = TransportInfo}}.
 
 handle_request(Id, <<"subscribe">>, Query, Vars, Extensions, #state{subscriptions = Subs} = St) ->
+    RegAtom = binary_to_atom(unicode:characters_to_binary(Query)),
+    true = register(RegAtom, self()),
     {noreply, St#state{subscriptions = [{Id, Query, Vars, Extensions} | Subs]}};
 handle_request(Id, <<"echo">>, Query, Vars, Extensions, #state{} = St) ->
     Result =
@@ -83,7 +95,7 @@ handle_request(Id, <<"echo">>, Query, Vars, Extensions, #state{} = St) ->
             },
             [], #{}},
     {reply, Result, St};
-handle_request(Id, <<"error-graphql">>, Query, Vars, Extensions, St) ->
+handle_request(Id, <<"data-and-errors">>, Query, Vars, Extensions, St) ->
     Result =
         {Id, true,
             #{
@@ -107,10 +119,10 @@ handle_cancel(Id, #state{subscriptions = Subs0} = St) ->
     Subs = lists:keydelete(Id, 1, Subs0),
     {noreply, St#state{subscriptions = Subs}}.
 
-handle_info({publish, From, Id}, #state{subscriptions = Subs} = St) ->
+handle_info({publish, From, Id, Done}, #state{subscriptions = Subs} = St) ->
     {value, {Id, Query, Vars, Extensions}} = lists:keysearch(Id, 1, Subs),
     Result =
-        {Id, false,
+        {Id, Done,
             #{
                 <<"query">> => unicode:characters_to_binary(Query),
                 <<"vars">> => Vars,
@@ -119,6 +131,18 @@ handle_info({publish, From, Id}, #state{subscriptions = Subs} = St) ->
             [], #{}},
     From ! {ack, Id},
     {reply, Result, St};
+handle_info({publish_request_error, From, Id, Msg}, #state{subscriptions = Subs} = St) ->
+    {value, {Id, Query, Vars, Extensions}} = lists:keysearch(Id, 1, Subs),
+    GQLError = cowboy_graphql:graphql_error(
+        Msg, [], #{
+            query => unicode:characters_to_binary(Query),
+            vars => Vars,
+            exts => Extensions
+        }
+    ),
+    Err = cowboy_graphql:request_validation_error(Id, GQLError),
+    From ! {ack, Id},
+    {error, Err, St};
 handle_info({sync, From, Ref}, St) ->
     From ! {sync, Ref},
     {noreply, St};
