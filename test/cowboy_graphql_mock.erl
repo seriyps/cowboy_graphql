@@ -1,7 +1,7 @@
 -module(cowboy_graphql_mock).
 -behaviour(cowboy_graphql).
 
--export([start/1, stop/0, port/0, publish/3, publish_request_error/3, sync/1]).
+-export([start/1, stop/0, port/0, publish/4, publish_request_error/3, sync/1]).
 
 -export([connection/2, init/3, handle_request/6, handle_cancel/2, handle_info/2, terminate/2]).
 
@@ -32,8 +32,8 @@ routes(ws) ->
 stop() ->
     cowboy:stop_listener(?MODULE).
 
-publish(Conn, Id, Done) ->
-    whereis(Conn) ! {?FUNCTION_NAME, self(), Id, Done},
+publish(Conn, Id, Extra, Done) ->
+    whereis(Conn) ! {?FUNCTION_NAME, self(), Id, Extra, Done},
     receive
         {ack, Id} ->
             ok
@@ -119,14 +119,15 @@ handle_cancel(Id, #state{subscriptions = Subs0} = St) ->
     Subs = lists:keydelete(Id, 1, Subs0),
     {noreply, St#state{subscriptions = Subs}}.
 
-handle_info({publish, From, Id, Done}, #state{subscriptions = Subs} = St) ->
+handle_info({publish, From, Id, Extra, Done}, #state{subscriptions = Subs} = St) ->
     {value, {Id, Query, Vars, Extensions}} = lists:keysearch(Id, 1, Subs),
     Result =
         {Id, Done,
             #{
                 <<"query">> => unicode:characters_to_binary(Query),
                 <<"vars">> => Vars,
-                <<"extensions">> => Extensions
+                <<"extensions">> => Extensions,
+                <<"extra">> => Extra
             },
             [], #{}},
     From ! {ack, Id},

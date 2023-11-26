@@ -140,7 +140,8 @@ subscription_case(Cfg) when is_list(Cfg) ->
                 #{
                     <<"extensions">> => #{},
                     <<"query">> => <<"subscription_case">>,
-                    <<"vars">> => #{<<"k">> => <<"v">>}
+                    <<"vars">> => #{<<"k">> => <<"v">>},
+                    <<"extra">> => <<>>
                 }
         },
         pubsub(Resp, ?FUNCTION_NAME, false)
@@ -151,7 +152,8 @@ subscription_case(Cfg) when is_list(Cfg) ->
                 #{
                     <<"extensions">> => #{},
                     <<"query">> => <<"subscription_case">>,
-                    <<"vars">> => #{<<"k">> => <<"v">>}
+                    <<"vars">> => #{<<"k">> => <<"v">>},
+                    <<"extra">> => <<>>
                 }
         },
         pubsub(Resp, ?FUNCTION_NAME, false)
@@ -498,7 +500,7 @@ r({ReqId, apollo, Await}) ->
     Payload.
 
 pubsub({ReqId, graphql_ws, Await}, Conn, Done) ->
-    ok = cowboy_graphql_mock:publish(Conn, ReqId, Done),
+    ok = cowboy_graphql_mock:publish(Conn, ReqId, <<>>, Done),
     {ok, #{
         <<"type">> := <<"next">>,
         <<"id">> := ReqId,
@@ -506,7 +508,7 @@ pubsub({ReqId, graphql_ws, Await}, Conn, Done) ->
     }} = Await(),
     Payload;
 pubsub({ReqId, apollo, Await}, Conn, Done) ->
-    ok = cowboy_graphql_mock:publish(Conn, ReqId, Done),
+    ok = cowboy_graphql_mock:publish(Conn, ReqId, <<>>, Done),
     {ok, #{
         <<"type">> := <<"data">>,
         <<"id">> := ReqId,

@@ -2,6 +2,22 @@
 %%% @copyright (C) 2021, Sergey
 %%% @doc
 %%% Cowboy HTTP handler for graphql API
+%%%
+%%% It supports following REQUEST methods:
+%%% * HTTP GET with query, operationName, variables, extensions query string parameters
+%%% * HTTP POST with application/json payload
+%%% * HTTP POST with application/x-www-form-urlencoded payload
+%%% For POST payload is negotiated via Content-Type header
+%%% See https://github.com/graphql/graphql-over-http/blob/main/spec/GraphQLOverHTTP.md
+%%%
+%%% It supports following RESPONSE methods (negotiated via Accept header):
+%%% * application/json (only single reply can be delivered)
+%%%   See https://github.com/graphql/graphql-over-http/blob/main/spec/GraphQLOverHTTP.md#response
+%%% * multipart/mixed (multiple replies can be delivered, including subscription stream)
+%%%   See https://github.com/graphql/graphql-over-http/blob/main/rfcs/IncrementalDelivery.md
+%%%
+%%% We don't use `application/graphql-response+json' yet, just `application/json'.
+%%% Non-graphql-execution errors are also reported as `application/json'
 %%% @end
 %%% Created : 14 Feb 2021 by Sergey <me@seriyps.ru>
 
@@ -30,26 +46,36 @@
     cb_state :: any(),
     json_encode :: fun((any()) -> iodata()),
     json_decode :: fun((binary()) -> any()),
+    resp_method :: {output_content_type(), binary(), any()} | undefined,
     methods :: ordsets:ordset(binary()),
     inputs :: #{{binary(), binary()} => input_content_type()},
+    outputs :: [{{binary(), binary()}, output_content_type()}],
     opts :: options(),
     error :: undefined | tuple(),
-    req :: cowboy_req:req()
+    headers_sent = false :: boolean()
 }).
 
 %% -type json_object() :: tm_graphql_ws_handler:json_object().
 -type input_content_type() :: json | x_www_form_urlencoded.
+-type output_content_type() :: json | multipart.
 -type options() :: #{
     accept_body => [input_content_type()],
+    response_types => [output_content_type()],
     allowed_methods => [post | get],
     json_mod => module(),
     max_body_size => pos_integer()
 }.
+%% HTTP handler options
+%% * accept_body - what POST body content-types we allow (negotiated via `Content-Type' request hdr)
+%% * response_types - in what `Content-Type' the body should be returned (negotiated via `Accept'
+%%   request header)
+%% If request header is not provided, the first element of the config list will be choosen
 -opaque config() :: {module(), any(), options()}.
 
 -type features() :: #{
     method => post | get,
-    payload_type => query_string | input_content_type()
+    payload_type => query_string | input_content_type(),
+    response_type => output_content_type()
 }.
 
 -define(INPUT_CT_MAP, #{
@@ -59,6 +85,10 @@
 -define(METHOD_MAP, #{
     get => <<"GET">>,
     post => <<"POST">>
+}).
+-define(OUTPUT_CT_MAP, #{
+    json => {<<"application">>, <<"json">>},
+    multipart => {<<"multipart">>, <<"mixed">>}
 }).
 
 -define(REQ_ID, <<"1">>).
@@ -74,6 +104,7 @@ config(Callback, CallbackOptions, TransportOptions) ->
 init(Req, {Callback, CallbackOpts, Params0}) ->
     DefaultParams = #{
         accept_body => [json, x_www_form_urlencoded],
+        response_types => [json, multipart],
         allowed_methods => [post, get],
         json_mod => jsx,
         max_body_size => 5 * 1024 * 1024
@@ -100,34 +131,21 @@ init(Req, {Callback, CallbackOpts, Params0}) ->
                 ),
                 []};
         {ok, CbState} ->
-            do(Req, Callback, CbState, Params)
+            %% We need to translate `cowboy_loop' return tuples to `cowboy_handler' tuples
+            case do(Req, Callback, CbState, Params) of
+                {ok, Req1, St} ->
+                    {cowboy_loop, Req1, St};
+                {stop, Req1, St} ->
+                    {ok, Req1, St}
+            end
     end.
 
 info(Msg, Req0, #state{cb = Callback, cb_state = CallbackState0} = St) ->
     case cowboy_graphql:call_handle_info(Callback, Msg, CallbackState0) of
         {noreply, CallbackState} ->
             {ok, Req0, St#state{cb_state = CallbackState}};
-        {reply, {?REQ_ID, Done, Data, Errors, Extensions}, CallbackState1} ->
-            Result0 = cowboy_graphql:put_not_empty(<<"data">>, Data, #{}),
-            Result1 = cowboy_graphql:put_not_empty(<<"extensions">>, Extensions, Result0),
-            Result = cowboy_graphql:put_not_empty(<<"errors">>, Errors, Result1),
-            CallbackState =
-                case Done of
-                    true ->
-                        CallbackState1;
-                    false ->
-                        {noreply, CallbackState_} = cowboy_graphql:call_handle_cancel(
-                            Callback, ?REQ_ID, CallbackState1
-                        ),
-                        CallbackState_
-                end,
-            Req = cowboy_req:reply(
-                200,
-                #{<<"content-type">> => <<"application/json">>},
-                json_encode(Result, St),
-                Req0
-            ),
-            {stop, Req, St#state{cb_state = CallbackState}};
+        {reply, Resp, CallbackState1} ->
+            response(Resp, Req0, St#state{cb_state = CallbackState1});
         {error, Err, CallbackState} ->
             ?LOG_INFO(
                 #{
@@ -139,6 +157,7 @@ info(Msg, Req0, #state{cb = Callback, cb_state = CallbackState0} = St) ->
                 #{domain => ?LOG_DOMAIN}
             ),
             {Code, ResBody} = format_error([request_error, other_error], Err),
+            %% FIXME: This is wrong for multipart/mixed!
             {stop,
                 cowboy_req:reply(
                     Code,
@@ -156,6 +175,7 @@ do(
     #{
         allowed_methods := AllowedMethods,
         accept_body := Accept,
+        response_types := RespTypes,
         json_mod := JsonMod
     } = Params
 ) ->
@@ -168,6 +188,7 @@ do(
             Accept
         )
     ),
+    Outputs = [{maps:get(Name, ?OUTPUT_CT_MAP), Name} || Name <- RespTypes],
     St0 = #state{
         cb = Callback,
         cb_state = CbState,
@@ -175,18 +196,18 @@ do(
         json_decode = fun JsonMod:decode/1,
         methods = ordsets:from_list([maps:get(M, ?METHOD_MAP) || M <- AllowedMethods]),
         inputs = Inputs,
-        opts = Params,
-        req = Req0
+        outputs = Outputs,
+        opts = Params
     },
-    RespHeaders = #{<<"content-type">> => <<"application/json">>},
-    try execute(St0) of
-        {ok, ResBody, #state{req = Req1} = St1} ->
-            ?LOG_DEBUG(#{tag => graphql_success, result => ResBody}, #{domain => ?LOG_DOMAIN}),
-            {ok, cowboy_req:reply(200, RespHeaders, json_encode(ResBody, St1), Req1), St1};
-        {loop, #state{req = Req1} = St1} ->
-            {cowboy_loop, Req1, St1}
+    ErrRespHeaders = #{<<"content-type">> => <<"application/json">>},
+    try execute(Req0, St0) of
+        {reply, Rep, Req, St1} ->
+            ?LOG_DEBUG(#{tag => graphql_success, result => Rep}, #{domain => ?LOG_DOMAIN}),
+            response(Rep, Req, St1);
+        {loop, Req, St1} ->
+            {ok, Req, St1}
     catch
-        throw:{callback, #state{req = Req1} = St1, Error} ->
+        throw:{{callback, St1, Error}, Req1} ->
             %% Error returned from callback module
             ?LOG_NOTICE(
                 #{
@@ -197,10 +218,11 @@ do(
                 #{domain => ?LOG_DOMAIN}
             ),
             {Code, ResBody} = format_error([protocol_error], Error),
-            {ok, cowboy_req:reply(Code, RespHeaders, json_encode(ResBody, St1), Req1), St1#state{
-                error = Error
-            }};
-        throw:{?MODULE, #state{req = Req1} = St1, ProtocolError} when is_tuple(ProtocolError) ->
+            {stop, cowboy_req:reply(Code, ErrRespHeaders, json_encode(ResBody, St1), Req1),
+                St1#state{
+                    error = Error
+                }};
+        throw:{{?MODULE, St1, ProtocolError}, Req1} when is_tuple(ProtocolError) ->
             %% Error generated by this module
             ?LOG_NOTICE(
                 #{
@@ -211,9 +233,10 @@ do(
                 #{domain => ?LOG_DOMAIN}
             ),
             {Code, ResBody} = format_error([protocol_error], ProtocolError),
-            {ok, cowboy_req:reply(Code, RespHeaders, json_encode(ResBody, St1), Req1), St1#state{
-                error = ProtocolError
-            }};
+            {stop, cowboy_req:reply(Code, ErrRespHeaders, json_encode(ResBody, St1), Req1),
+                St1#state{
+                    error = ProtocolError
+                }};
         Type:Reason:Stack ->
             %% Unexpected crash
             ErrId = erlang:unique_integer(),
@@ -235,9 +258,10 @@ do(
                         )
                     ]
             },
-            {ok, cowboy_req:reply(500, RespHeaders, json_encode(ResBody, St0), Req0), St0#state{
-                error = {crash, Type, {?MODULE, Reason, Stack}}
-            }}
+            {stop, cowboy_req:reply(500, ErrRespHeaders, json_encode(ResBody, St0), Req0),
+                St0#state{
+                    error = {crash, Type, {?MODULE, Reason, Stack}}
+                }}
     end.
 
 terminate(normal, _PartialReq, #state{cb = Callback, cb_state = CallbackState, error = Err}) when
@@ -262,56 +286,64 @@ terminate(Reason, PartialReq, State) ->
 %% Internal
 %%
 
-execute(#state{cb = Callback, cb_state = CallbackState0} = St0) ->
-    {HttpMethod, PayloadLocation} = negotiate(St0),
-    TransportInfo = {http, #{method => HttpMethod, payload_type => PayloadLocation}},
+execute(Req0, #state{cb = Callback, cb_state = CallbackState0} = St0) ->
+    {HttpMethod, PayloadLocation, {RespTypeName, _, _} = RespType} = negotiate(Req0, St0),
+    TransportInfo =
+        {http, #{
+            method => HttpMethod, payload_type => PayloadLocation, response_type => RespTypeName
+        }},
     {ok, _Extra, CallbackState1} = cowboy_graphql:call_init(
         Callback, #{}, TransportInfo, CallbackState0
     ),
-    {St1, Payload} = parse_payload(HttpMethod, PayloadLocation, St0),
-    {OpName, Doc, Vars, Ext} = decode(Payload, St1),
-    Id = ?REQ_ID,
-    case cowboy_graphql:call_handle_request(Callback, Id, OpName, Doc, Vars, Ext, CallbackState1) of
+    {Req1, St1, Payload} = parse_payload(HttpMethod, PayloadLocation, Req0, St0),
+    {OpName, Doc, Vars, Ext} = decode(Payload, Req1, St1),
+    case
+        cowboy_graphql:call_handle_request(
+            Callback, ?REQ_ID, OpName, Doc, Vars, Ext, CallbackState1
+        )
+    of
         {noreply, CallbackState} ->
             %% TODO: long-polling
             %% https://ninenines.eu/docs/en/cowboy/2.9/guide/loop_handlers/
-            {loop, St1#state{cb_state = CallbackState}};
-        {reply, {Id, true, Data, Errors, Extensions}, CallbackState} ->
-            Result0 = cowboy_graphql:put_not_empty(<<"data">>, Data, #{}),
-            Result1 = cowboy_graphql:put_not_empty(<<"extensions">>, Extensions, Result0),
-            Result = cowboy_graphql:put_not_empty(<<"errors">>, Errors, Result1),
-            {ok, Result, St1#state{cb_state = CallbackState}};
+            {loop, Req1, St1#state{cb_state = CallbackState, resp_method = RespType}};
+        {reply, Rep, CallbackState} ->
+            {reply, Rep, Req1, St1#state{cb_state = CallbackState, resp_method = RespType}};
         {error, Reason, CallbackState} ->
-            throw({callback, St1#state{cb_state = CallbackState}, Reason})
+            throw_err(Req1, {callback, St1#state{cb_state = CallbackState}, Reason})
     end.
 
-negotiate(
+negotiate(Req, #state{} = St) ->
+    {ReqMethod, ReqBodyLoc} = negotiate_req(Req, St),
+    RespMethod = negotiate_resp(Req, St),
+    {ReqMethod, ReqBodyLoc, RespMethod}.
+
+negotiate_req(
+    Req,
     #state{
         opts = #{max_body_size := MaxSize, accept_body := Accepts},
         methods = AllowedMethods,
-        inputs = Inputs,
-        req = Req
+        inputs = Inputs
     } = St
 ) ->
     Method = cowboy_req:method(Req),
     lists:member(Method, AllowedMethods) orelse
-        throw(err(St, method_not_allowed)),
+        throw_err(Req, err(St, method_not_allowed)),
     case Method of
         <<"GET">> ->
             case cowboy_req:qs(Req) of
                 <<>> ->
-                    throw(err(St, missing_query_string));
+                    throw_err(Req, err(St, missing_query_string));
                 Bin when byte_size(Bin) > MaxSize ->
-                    throw(err(St, request_too_large));
+                    throw_err(Req, err(St, request_too_large));
                 _ ->
                     {get, query_string}
             end;
         <<"POST">> ->
             case {cowboy_req:has_body(Req), cowboy_req:body_length(Req)} of
                 {_, Size} when is_integer(Size), Size > MaxSize ->
-                    throw(err(St, request_too_large));
+                    throw_err(Req, err(St, request_too_large));
                 {false, _} ->
-                    throw(err(St, missing_request_body));
+                    throw_err(Req, err(St, missing_request_body));
                 _ ->
                     ok
             end,
@@ -324,12 +356,43 @@ negotiate(
                 end}
     end.
 
-parse_payload(get, query_string, #state{req = Req} = St) ->
+negotiate_resp(Req, #state{outputs = Outputs}) ->
+    %% Simplified "accept" matching; example of the more complex one can be found in
+    %% cowboy_rest:content_types_provided/2, but we will use simpler one
+    Accepts = cowboy_req:parse_header(<<"accept">>, Req, []),
+    PrioAccepts = lists:sort(fun({_, WL, _}, {_, WR, _}) -> WL >= WR end, Accepts),
+    Choosen =
+        case
+            lists:filtermap(
+                fun({{T, S, _}, _, _}) ->
+                    case lists:keyfind({T, S}, 1, Outputs) of
+                        false -> false;
+                        {_, _} = Res -> {true, Res}
+                    end
+                end,
+                PrioAccepts
+            )
+        of
+            [{_, _} = Found | _] ->
+                Found;
+            [] ->
+                hd(Outputs)
+        end,
+    case Choosen of
+        {{N, V}, json} ->
+            {json, <<N/binary, "/", V/binary>>, undefined};
+        {{N, V}, multipart} ->
+            Boundary = cow_multipart:boundary(),
+            {multipart, <<N/binary, "/", V/binary, ";boundary=", Boundary/binary>>, Boundary}
+    end.
+
+parse_payload(get, query_string, Req, St) ->
     try cowboy_req:parse_qs(Req) of
-        KV -> {St, maps:from_list(KV)}
+        KV -> {Req, St, maps:from_list(KV)}
     catch
         exit:{request_error, qs, Reason} when is_atom(Reason) ->
-            throw(
+            throw_err(
+                Req,
                 err(
                     St,
                     invalid_query_string,
@@ -339,16 +402,16 @@ parse_payload(get, query_string, #state{req = Req} = St) ->
             )
     end;
 parse_payload(
-    post, x_www_form_urlencoded, #state{req = Req0, opts = #{max_body_size := MaxSize}} = St
+    post, x_www_form_urlencoded, Req0, #state{opts = #{max_body_size := MaxSize}} = St
 ) ->
     {ok, KV, Req1} = cowboy_req:read_urlencoded_body(Req0, #{length => MaxSize}),
-    {St#state{req = Req1}, maps:from_list(KV)};
-parse_payload(post, json, #state{req = Req0, opts = #{max_body_size := MaxSize}} = St) ->
+    {Req1, St, maps:from_list(KV)};
+parse_payload(post, json, Req0, #state{opts = #{max_body_size := MaxSize}} = St) ->
     {ok, ReqBody, Req1} = cowboy_req:read_body(Req0, #{length => MaxSize}),
     KV = json_decode(ReqBody, St),
-    {St#state{req = Req1}, KV}.
+    {Req1, St, KV}.
 
-decode(#{<<"query">> := Doc} = Data, St) when is_binary(Doc) ->
+decode(#{<<"query">> := Doc} = Data, _Req, St) when is_binary(Doc) ->
     Vars = maps:get(<<"variables">>, Data, #{}),
     OpName = maps:get(<<"operationName">>, Data, undefined),
     Extensions = maps:get(<<"extensions">>, Data, #{}),
@@ -360,8 +423,9 @@ decode(#{<<"query">> := Doc} = Data, St) when is_binary(Doc) ->
             V
     end,
     {OpName, DocStr, ParseMap(Vars), ParseMap(Extensions)};
-decode(_, St) ->
-    throw(
+decode(_, Req, St) ->
+    throw_err(
+        Req,
         err(
             St,
             missing_parameter,
@@ -369,6 +433,59 @@ decode(_, St) ->
             #{parameter => query}
         )
     ).
+
+-spec response(cowboy_graphql:result(), cowboy_req:req(), #state{}) ->
+    {ok, cowboy_req:req(), #state{}}
+    | {stop, cowboy_req:req(), #state{}}.
+response(
+    {?REQ_ID, true, Data, Errors, Extensions},
+    Req,
+    #state{resp_method = {json, Hdr, _}, headers_sent = false} = St
+) ->
+    Result0 = cowboy_graphql:put_not_empty(<<"data">>, Data, #{}),
+    Result1 = cowboy_graphql:put_not_empty(<<"extensions">>, Extensions, Result0),
+    Result = cowboy_graphql:put_not_empty(<<"errors">>, Errors, Result1),
+    {ok, cowboy_req:reply(200, #{<<"content-type">> => Hdr}, json_encode(Result, St), Req), St};
+response(
+    {_, false, _, _, _} = Resp,
+    Req,
+    #state{resp_method = {json, _, _}, cb = Callback, cb_state = CbState0} = St
+) ->
+    %% force-cancel the request because `json' method only supports single reply
+    {noreply, CbState} = cowboy_graphql:call_handle_cancel(
+        Callback, ?REQ_ID, CbState0
+    ),
+    response(setelement(2, Resp, true), Req, St#state{cb_state = CbState});
+response(
+    {?REQ_ID, Done, Data, Errors, Extensions},
+    Req0,
+    #state{resp_method = {multipart, Hdr, Boundary}, headers_sent = HdrsSent} = St
+) ->
+    {Req1, St1} =
+        case HdrsSent of
+            true ->
+                {Req0, St};
+            false ->
+                {cowboy_req:stream_reply(200, #{<<"content-type">> => Hdr}, Req0), St#state{
+                    headers_sent = true
+                }}
+        end,
+    Chunk = cow_multipart:part(Boundary, [
+        {<<"content-type">>, <<"application/json; charset=utf-8">>}
+    ]),
+    Result0 = cowboy_graphql:put_not_empty(<<"data">>, Data, #{}),
+    Result1 = cowboy_graphql:put_not_empty(<<"extensions">>, Extensions, Result0),
+    Result = cowboy_graphql:put_not_empty(<<"errors">>, Errors, Result1),
+    Body = json_encode(Result, St),
+    case Done of
+        true ->
+            Close = cow_multipart:close(Boundary),
+            ok = cowboy_req:stream_body([Chunk, Body | Close], fin, Req1),
+            {stop, Req1, St1};
+        false ->
+            ok = cowboy_req:stream_body([Chunk, Body], nofin, Req1),
+            {ok, Req1, St1}
+    end.
 
 format_error(Allowed, Err) ->
     lists:member(element(1, Err), Allowed) orelse
@@ -402,6 +519,9 @@ err(State, Tag) when is_atom(Tag) ->
         State,
         cowboy_graphql:protocol_error(http, Tag, atom_to_binary(Tag, utf8), #{})
     }.
+
+throw_err(Req, Err) ->
+    throw({Err, Req}).
 
 json_decode(Json, #state{json_decode = Decode}) ->
     Decode(Json).

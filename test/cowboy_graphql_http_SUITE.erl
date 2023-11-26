@@ -11,8 +11,10 @@
 
 -export([
     echo_case/1,
+    echo_multipart_case/1,
     graphql_error_case/1,
     subscription_case/1,
+    subscription_multipart_case/1,
     subscription_autocancel_case/1,
     subscription_request_error_case/1,
     handle_request_validation_error_case/1,
@@ -23,7 +25,7 @@
     protocol_error_method_gencase/1
 ]).
 
--record(cli, {gun}).
+-record(cli, {gun, accept}).
 -define(APP, cowboy_graphql).
 
 -include_lib("stdlib/include/assert.hrl").
@@ -101,6 +103,43 @@ echo_case(Cfg) when is_list(Cfg) ->
     ),
     ok.
 
+%% @doc Simple echo command over multipart/mixed (happy path)
+echo_multipart_case({pre, Cfg}) ->
+    Cfg;
+echo_multipart_case({post, Cfg}) ->
+    Cfg;
+echo_multipart_case(Cfg) when is_list(Cfg) ->
+    Cli = client(<<"multipart/mixed">>),
+    {200, Hdrs, NextChunkFun} =
+        r(
+            request(
+                Cli,
+                enc(Cfg),
+                "/api/ok--",
+                <<"echo">>,
+                <<"graphql query">>,
+                #{<<"k">> => <<"v">>},
+                #{<<"ek">> => <<"ev">>}
+            )
+        ),
+    ?assertMatch(<<"multipart/mixed", _/binary>>, proplists:get_value(<<"content-type">>, Hdrs)),
+    {done, ChunkHdrs, Data} = NextChunkFun(),
+    ?assertMatch(
+        <<"application/json", _/binary>>, proplists:get_value(<<"content-type">>, ChunkHdrs)
+    ),
+    ?assertEqual(
+        #{
+            <<"data">> =>
+                #{
+                    <<"extensions">> => #{<<"ek">> => <<"ev">>},
+                    <<"query">> => <<"graphql query">>,
+                    <<"vars">> => #{<<"k">> => <<"v">>}
+                }
+        },
+        Data
+    ),
+    ok.
+
 %% @doc Same as `echo_case', but callback reports GraphQL executor error
 graphql_error_case({pre, Cfg}) ->
     Cfg;
@@ -152,7 +191,7 @@ subscription_case(Cfg) when is_list(Cfg) ->
     %% TODO: better synchronization, request/6 is asynchronous
     timer:sleep(300),
     ok = cowboy_graphql_mock:sync(?FUNCTION_NAME),
-    {200, Hdrs, Payload} = pubsub(?FUNCTION_NAME, Resp, true),
+    {200, Hdrs, Payload} = pubsub(?FUNCTION_NAME, Resp, #{}, true),
     ?assertEqual(<<"application/json">>, proplists:get_value(<<"content-type">>, Hdrs)),
     ?assertEqual(
         #{
@@ -160,10 +199,63 @@ subscription_case(Cfg) when is_list(Cfg) ->
                 #{
                     <<"extensions">> => #{},
                     <<"query">> => <<"subscription_case">>,
-                    <<"vars">> => #{<<"k">> => <<"v">>}
+                    <<"vars">> => #{<<"k">> => <<"v">>},
+                    <<"extra">> => #{}
                 }
         },
         Payload
+    ).
+
+%% @doc Subscription over HTTP with multipart/mixed response body
+subscription_multipart_case({pre, Cfg}) ->
+    Cfg;
+subscription_multipart_case({post, Cfg}) ->
+    Cfg;
+subscription_multipart_case(Cfg) when is_list(Cfg) ->
+    F = atom_to_binary(?FUNCTION_NAME),
+    Cli = client(<<"multipart/mixed">>),
+    Resp = request(Cli, enc(Cfg), "/api/ok--pubsub", <<"subscribe">>, F, #{<<"k">> => <<"v">>}),
+    %% TODO: better synchronization, request/6 is asynchronous
+    timer:sleep(300),
+    ok = cowboy_graphql_mock:sync(?FUNCTION_NAME),
+    {200, Hdrs, NextChunkFun1} = pubsub(?FUNCTION_NAME, Resp, <<"req1">>, false),
+    ?assertMatch(<<"multipart/mixed", _/binary>>, proplists:get_value(<<"content-type">>, Hdrs)),
+    %% HTTP/1.1 but not HTTP/2
+    %% ?assertEqual(<<"chunked">>, proplists:get_value(<<"transfer-encoding">>, Hdrs)),
+
+    {ok, ChunkHdrs1, Data1, NextChunkFun2} = NextChunkFun1(),
+    ?assertMatch(
+        <<"application/json", _/binary>>,
+        proplists:get_value(<<"content-type">>, ChunkHdrs1)
+    ),
+    ?assertEqual(
+        #{
+            <<"data">> =>
+                #{
+                    <<"extensions">> => #{},
+                    <<"query">> => <<"subscription_multipart_case">>,
+                    <<"vars">> => #{<<"k">> => <<"v">>},
+                    <<"extra">> => <<"req1">>
+                }
+        },
+        Data1
+    ),
+    {done, ChunkHdrs2, Data2} = pubsub(?FUNCTION_NAME, NextChunkFun2, <<"req2">>, true),
+    ?assertMatch(
+        <<"application/json", _/binary>>,
+        proplists:get_value(<<"content-type">>, ChunkHdrs2)
+    ),
+    ?assertEqual(
+        #{
+            <<"data">> =>
+                #{
+                    <<"extensions">> => #{},
+                    <<"query">> => <<"subscription_multipart_case">>,
+                    <<"vars">> => #{<<"k">> => <<"v">>},
+                    <<"extra">> => <<"req2">>
+                }
+        },
+        Data2
     ).
 
 %% @doc Subscription over HTTP with long-polling - it is ok to return `Done = false'
@@ -179,7 +271,7 @@ subscription_autocancel_case(Cfg) when is_list(Cfg) ->
     %% TODO: better synchronization, request/6 is asynchronous
     timer:sleep(300),
     ok = cowboy_graphql_mock:sync(?FUNCTION_NAME),
-    {200, Hdrs, Payload} = pubsub(?FUNCTION_NAME, Resp, false),
+    {200, Hdrs, Payload} = pubsub(?FUNCTION_NAME, Resp, #{}, false),
     ?assertEqual(<<"application/json">>, proplists:get_value(<<"content-type">>, Hdrs)),
     ?assertEqual(
         #{
@@ -187,7 +279,8 @@ subscription_autocancel_case(Cfg) when is_list(Cfg) ->
                 #{
                     <<"extensions">> => #{},
                     <<"query">> => <<"subscription_autocancel_case">>,
-                    <<"vars">> => #{<<"k">> => <<"v">>}
+                    <<"vars">> => #{<<"k">> => <<"v">>},
+                    <<"extra">> => #{}
                 }
         },
         Payload
@@ -363,7 +456,7 @@ protocol_error_method_gencase({post, Cfg}) ->
 protocol_error_method_gencase(Cfg) when is_list(Cfg) ->
     #cli{gun = Gun} = client(),
     Stream = gun:put(Gun, "/api/ok--", [], <<"{}">>),
-    {400, Hdrs, Payload} = http_await_with_json_body(Gun, Stream),
+    {400, Hdrs, Payload} = http_await_with_json_body(Gun, Stream, <<"application/json">>),
     ?assertEqual(<<"application/json">>, proplists:get_value(<<"content-type">>, Hdrs)),
     ?assertEqual(
         #{
@@ -382,9 +475,12 @@ protocol_error_method_gencase(Cfg) when is_list(Cfg) ->
 %% Test client
 
 client() ->
+    client(<<"application/json">>).
+
+client(Accept) ->
     {ok, Pid} = gun:open("localhost", cowboy_graphql_mock:port()),
     {ok, http} = gun:await_up(Pid),
-    #cli{gun = Pid}.
+    #cli{gun = Pid, accept = Accept}.
 
 r(Reader) ->
     Reader().
@@ -395,10 +491,10 @@ enc(Cfg) ->
 request(C, Format, Path, Op, Query, Vars) ->
     request(C, Format, Path, Op, Query, Vars, null).
 
-request(C, post_json, Path, Operation, Query, Vars, Extensions) ->
+request(#cli{accept = Accept} = C, post_json, Path, Operation, Query, Vars, Extensions) ->
     Headers = [
         {<<"Content-Type">>, <<"application/json">>},
-        {<<"Accept">>, <<"application/json">>}
+        {<<"Accept">>, Accept}
     ],
     Body = jsx:encode(
         preprocess(
@@ -412,10 +508,10 @@ request(C, post_json, Path, Operation, Query, Vars, Extensions) ->
         )
     ),
     http_post_path(Path, Headers, Body, C);
-request(C, post_form, Path, Operation, Query, Vars, Extensions) ->
+request(#cli{accept = Accept} = C, post_form, Path, Operation, Query, Vars, Extensions) ->
     Headers = [
         {<<"Content-Type">>, <<"application/x-www-form-urlencoded">>},
-        {<<"Accept">>, <<"application/json">>}
+        {<<"Accept">>, Accept}
     ],
     Body = cow_qs:qs(
         preprocess(
@@ -429,8 +525,8 @@ request(C, post_form, Path, Operation, Query, Vars, Extensions) ->
         )
     ),
     http_post_path(Path, Headers, Body, C);
-request(C, get_qs, Path, Operation, Query, Vars, Extensions) ->
-    Headers = [{<<"Accept">>, <<"application/json">>}],
+request(#cli{accept = Accept} = C, get_qs, Path, Operation, Query, Vars, Extensions) ->
+    Headers = [{<<"Accept">>, Accept}],
     QS = cow_qs:qs(
         preprocess(
             [
@@ -445,25 +541,51 @@ request(C, get_qs, Path, Operation, Query, Vars, Extensions) ->
     FullPath = iolist_to_binary([Path, $?, QS]),
     http_get_path(FullPath, Headers, C).
 
-http_get_path(UrlPath, Hdrs, #cli{gun = Http}) ->
+http_get_path(UrlPath, Hdrs, #cli{gun = Http, accept = Accept}) ->
     Stream = gun:get(Http, UrlPath, Hdrs),
-    fun() -> http_await_with_json_body(Http, Stream) end.
+    fun() -> http_await_with_json_body(Http, Stream, Accept) end.
 
-http_post_path(UrlPath, Hdrs, Body, #cli{gun = Http}) ->
+http_post_path(UrlPath, Hdrs, Body, #cli{gun = Http, accept = Accept}) ->
     Stream = gun:post(Http, UrlPath, Hdrs, Body),
-    fun() -> http_await_with_json_body(Http, Stream) end.
+    fun() -> http_await_with_json_body(Http, Stream, Accept) end.
 
-http_await_with_json_body(Pid, Stream) ->
+http_await_with_json_body(Pid, Stream, Accept) ->
     case gun:await(Pid, Stream) of
         {response, fin, Status, Headers} ->
             {Status, Headers};
-        {response, nofin, Status, Headers} ->
+        {response, nofin, Status, Headers} when Accept == <<"application/json">> ->
             {ok, Body} = gun:await_body(Pid, Stream),
-            {Status, Headers, jsx:decode(Body)}
+            {Status, Headers, jsx:decode(Body)};
+        {response, nofin, Status, Headers} when Accept == <<"multipart/mixed">> ->
+            ct:pal("Status: ~p~nHeaders: ~p", [Status, Headers]),
+            <<"multipart/mixed;boundary=", Boundary/binary>> = proplists:get_value(
+                <<"content-type">>, Headers
+            ),
+            {Status, Headers, fun() -> next_chunk(Pid, Stream, Boundary) end}
     end.
 
-pubsub(Proc, Await, Done) ->
-    ok = cowboy_graphql_mock:publish(Proc, <<"1">>, Done),
+next_chunk(Pid, Stream, Boundary) ->
+    receive
+        {gun_data, Pid, Stream, IsFin, Data} ->
+            {ok, PartHdrs, Rest} = cow_multipart:parse_headers(Data, Boundary),
+            case IsFin of
+                fin ->
+                    {done, Body, _Trail} = cow_multipart:parse_body(Rest, Boundary),
+                    Struct = jsx:decode(Body),
+                    {done, PartHdrs, Struct};
+                nofin ->
+                    {ok, Body} = cow_multipart:parse_body(Rest, Boundary),
+                    Struct = jsx:decode(Body),
+                    {ok, PartHdrs, Struct, fun() -> next_chunk(Pid, Stream, Boundary) end}
+            end;
+        Other ->
+            Other
+    after 5000 ->
+        error(timeout)
+    end.
+
+pubsub(Proc, Await, Extra, Done) ->
+    ok = cowboy_graphql_mock:publish(Proc, <<"1">>, Extra, Done),
     Await().
 
 pubsub_error(Proc, Await, Msg) ->

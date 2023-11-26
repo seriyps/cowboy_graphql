@@ -11,6 +11,14 @@ It supports following transport protocols:
 * WebSocket [graphql_ws](https://github.com/enisdenjo/graphql-ws/blob/master/PROTOCOL.md)
 * WebSocket [apollo](https://github.com/apollographql/subscriptions-transport-ws/blob/master/PROTOCOL.md)
 
+For HTTP transport the response payload can be delivered as:
+
+* `application/json` - only single response will be delivered.
+   See [spec](https://github.com/graphql/graphql-over-http/blob/main/spec/GraphQLOverHTTP.md#response).
+* `multipart/mixed` delivered in chunks (each chunk as `application/json`). Multiple responses
+   can be delivered for subscriptions.
+   See [spec](https://github.com/graphql/graphql-over-http/blob/main/rfcs/IncrementalDelivery.md).
+
 It supports both request-response as well as subscriptions.
 It does not dictate the specific GraphQL executor implementation (however,
 https://github.com/jlouis/graphql-erlang is assumed).
@@ -50,6 +58,9 @@ init(Params :: json_object(), TransportInfo :: transport_info(), State :: handle
 
 Function is called when the connection is established (for HTTP - imediately after `connection`,
 for WebSocket - when `ConnectionInit` message is received).
+
+The `TransportInfo` parameter provides some details about the transport and its features that was
+chosen for this connection (eg, is it WebSocket or HTTP? was it POST or GET? etc).
 
 This callback can be used to set-up all the timers/monitors, register the process in process
 registry etc.
@@ -114,10 +125,9 @@ handle_info(Msg :: any(), State :: handler_state()) ->
 Is called when the Erlang process that represents the connection receives regular messages from
 other processes (eg, from pub-sub system).
 
-**For HTTP transport** `reply` or `error` can be returned only once. If the `result()` has
-`Done` flag set to `false`, `handle_cancel/2` will be called immediately for HTTP.
-But we may add streaming over [SSE](https://html.spec.whatwg.org/multipage/server-sent-events.html)
-later (if client signals `Accept: text/event-stream`).
+**For HTTP transport** when `json` response encoding is chosen, `reply` or `error` can be returned
+only once. If the `result()` has `Done` flag set to `false`, `handle_cancel/2` will be called
+immediately for `json`. For `multipart` method there is no such limitation.
 
 ### `terminate`
 
@@ -145,6 +155,7 @@ start() ->
         cowboy_graphql:http_config(
             CallbackMod, Opts, #{json_mod => jsx,
                                  accept_body => [json, x_www_form_urlencoded],
+                                 response_types => [json, multipart],
                                  allowed_methods => [post, get],
                                  max_body_size => 5 * 1024 * 1024})};
     {"/api/websocket", cowboy_graphql_ws_handler,
@@ -164,3 +175,27 @@ start() ->
   ).
 
 ```
+
+### HTTP options
+
+* `accept_body => [json | x_www_form_urlencoded]` - for POST requests, the list of
+  allowed request `Content-Type`
+* `response_types => [json | multipart]` - the list of allowed request `Accept` encoding types for
+  response body. `json` allows only single response while `multipart` supports multiple responses
+  (eg, subscriptions producing multiple results)
+* `allowed_methods => [post | get]` - allowed HTTP methods
+* `json_mod => module()` - JSON library module. Should export
+  `encode(cowboy_graphql:json()) -> iodata()` and `decode(binary()) -> cowboy_graphql:json()`
+* `max_body_size => pos_integer()` - maximum allowed request body size
+
+For `accept_body` and `response_types` if no `Content-Type`/`Accept` header provided in the request,
+the first element of the list from the option will be used. Eg, if `response_types => [json, multipart]`
+and there is no `Accept` header in the request, then `json` (`application/json`) will be chosen.
+
+### WebSocket options
+
+* `protocols => [graphql_ws | apollo]` - list of GraphQL-over-websocket protocols to accept;
+  it will be negotiated via `Sec-WebSocket-Protocol` header. If no such header set, the first in
+  the list will be used
+* `json_mod => module()` same as in HTTP
+* `max_frame_size => pos_integer()` - maximum allowed size of single WebSocket request frame
