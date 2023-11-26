@@ -1,6 +1,6 @@
 {application, cowboy_graphql, [
     {description, "Generic graphql HTTP and websocket transports for Cowboy"},
-    {vsn, "0.1.0"},
+    {vsn, "0.2.0"},
     {registered, []},
     {applications, [
         kernel,

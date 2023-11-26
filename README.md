@@ -41,7 +41,7 @@ connection(cowboy_req:req(), Params :: any()) ->
 ```
 
 Function is called when the initial HTTP request is received (HTTP headers for HTTP or
-`Connection: Upgrade; Upgrade: websocket` request for HTTP).
+`Connection: Upgrade; Upgrade: websocket` request for WebSocket).
 
 This callback can be used to, eg, perform the authentication, inspect the HTTP headers, peer IP etc.
 
