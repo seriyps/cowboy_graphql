@@ -11,7 +11,7 @@ port() ->
     8881.
 
 start(Opts) ->
-    Routes = lists:map(fun routes/1, maps:get(transports, Opts, [http, ws])),
+    Routes = lists:map(fun routes/1, maps:get(transports, Opts, [{http, #{}}, {ws, #{}}])),
     Dispatch = cowboy_router:compile([{'_', Routes}]),
     {ok, _} = cowboy:start_clear(
         ?MODULE,
@@ -22,12 +22,12 @@ start(Opts) ->
         #{env => #{dispatch => Dispatch}}
     ).
 
-routes(http) ->
+routes({http, Opts}) ->
     {"/api/:on_connect", cowboy_graphql_http_handler,
-        cowboy_graphql:http_config(?MODULE, [opts], #{json_mod => jsx})};
-routes(ws) ->
+        cowboy_graphql:http_config(?MODULE, [opts], Opts#{json_mod => jsx})};
+routes({ws, Opts}) ->
     {"/api/:on_connect/websocket", cowboy_graphql_ws_handler,
-        cowboy_graphql:ws_config(?MODULE, [opts], #{json_mod => jsx})}.
+        cowboy_graphql:ws_config(?MODULE, [opts], Opts#{json_mod => jsx})}.
 
 stop() ->
     cowboy:stop_listener(?MODULE).

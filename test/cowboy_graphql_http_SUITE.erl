@@ -15,6 +15,7 @@
     graphql_error_case/1,
     subscription_case/1,
     subscription_multipart_case/1,
+    multipart_heartbeat_case/1,
     subscription_autocancel_case/1,
     subscription_request_error_case/1,
     handle_request_validation_error_case/1,
@@ -22,6 +23,7 @@
     handle_request_crash_case/1,
     connection_auth_error_case/1,
     connection_other_error_case/1,
+    timeout_case/1,
     protocol_error_method_gencase/1
 ]).
 
@@ -63,7 +65,14 @@ end_per_suite(Cfg) ->
     Cfg.
 
 init_per_testcase(Name, Cfg) ->
-    cowboy_graphql_mock:start(#{transports => [http]}),
+    Opts =
+        try
+            ?MODULE:Name({transport_opts, Cfg})
+        catch
+            error:function_clause ->
+                #{}
+        end,
+    cowboy_graphql_mock:start(#{transports => [{http, Opts}]}),
     ?MODULE:Name({pre, Cfg}).
 
 end_per_testcase(Name, Cfg) ->
@@ -258,6 +267,30 @@ subscription_multipart_case(Cfg) when is_list(Cfg) ->
         Data2
     ).
 
+%% @doc When `heartbeat' is set, empty json objects are streamed
+multipart_heartbeat_case({transport_opts, _Cfg}) ->
+    #{heartbeat => 100};
+multipart_heartbeat_case({pre, Cfg}) ->
+    Cfg;
+multipart_heartbeat_case({post, Cfg}) ->
+    Cfg;
+multipart_heartbeat_case(Cfg) when is_list(Cfg) ->
+    F = atom_to_binary(?FUNCTION_NAME),
+    Cli = client(<<"multipart/mixed">>),
+    Resp = request(Cli, enc(Cfg), "/api/ok--pubsub", <<"subscribe">>, F, #{<<"k">> => <<"v">>}),
+    {200, Hdrs, NextChunkFun1} = Resp(),
+    ?assertMatch(<<"multipart/mixed", _/binary>>, proplists:get_value(<<"content-type">>, Hdrs)),
+
+    {ok, ChunkHdrs1, Data1, NextChunkFun2} = NextChunkFun1(),
+    ?assertMatch(
+        <<"application/json", _/binary>>,
+        proplists:get_value(<<"content-type">>, ChunkHdrs1)
+    ),
+    ?assertEqual(#{}, Data1),
+    {ok, _ChunkHdrs2, Data2, _NextChunkFun3} = NextChunkFun2(),
+    ?assertEqual(#{}, Data2),
+    ok.
+
 %% @doc Subscription over HTTP with long-polling - it is ok to return `Done = false'
 %% When `Done = false', the `handle_cancel' callback will be called.
 subscription_autocancel_case({pre, Cfg}) ->
@@ -446,6 +479,35 @@ connection_other_error_case(Cfg) when is_list(Cfg) ->
     ?assertEqual(<<"application/json">>, proplists:get_value(<<"content-type">>, Hdrs)),
     ?assertEqual(
         #{<<"errors">> => [#{<<"message">> => <<"msg">>}]},
+        Payload
+    ).
+
+%% @doc Connection is closed with error prematurely when `timeout' is set
+timeout_case({transport_opts, _Cfg}) ->
+    #{timeout => 300};
+timeout_case({pre, Cfg}) ->
+    Cfg;
+timeout_case({post, Cfg}) ->
+    Cfg;
+timeout_case(Cfg) when is_list(Cfg) ->
+    F = atom_to_binary(?FUNCTION_NAME),
+    Cli = client(),
+    Resp = request(Cli, enc(Cfg), "/api/ok--pubsub", <<"subscribe">>, F, #{<<"k">> => <<"v">>}),
+    {200, Hdrs, Payload} = Resp(),
+    ?assertEqual(<<"application/json">>, proplists:get_value(<<"content-type">>, Hdrs)),
+    ?assertEqual(
+        #{
+            <<"errors">> =>
+                [
+                    #{
+                        <<"message">> => <<"Http processing error: Request execution timed out">>,
+                        <<"extensions">> => #{
+                            <<"code">> => <<"timeout">>,
+                            <<"timeout_ms">> => 300
+                        }
+                    }
+                ]
+        },
         Payload
     ).
 

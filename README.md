@@ -187,6 +187,17 @@ start() ->
 * `json_mod => module()` - JSON library module. Should export
   `encode(cowboy_graphql:json()) -> iodata()` and `decode(binary()) -> cowboy_graphql:json()`
 * `max_body_size => pos_integer()` - maximum allowed request body size
+* `heartbeat => pos_integer()` (milliseconds) - it only works for `multipart` streaming method
+  and it works by sending empty JSON object `{}` multipart bodies periodically to make sure connection
+  is not closed by client or proxy; it is a no-op for `json` method and if `handle_request` callback
+  returns `{reply, result(), ..}` with `Done` flag set to `true` (because connection is closed after
+  that). It does not make sense to set `heartbeat` to be smaller than `timeout`. Default: disabled.
+* `timeout => timeout()` (milliseconds) - close the connection after this many milliseconds no
+  matter what (`terminate(timeout, ...)` callback will be called). Set to `infinity` to disable.
+  Default: 10 minutes
+
+Both `heartbeat` and `timeout` timers are only started after `handle_call` callback returns `noreply`.
+So the timeout is "soft". If your `handle_call` is slow, it won't be interrupted.
 
 For `accept_body` and `response_types` if no `Content-Type`/`Accept` header provided in the request,
 the first element of the list from the option will be used. Eg, if `response_types => [json, multipart]`
@@ -196,6 +207,18 @@ and there is no `Accept` header in the request, then `json` (`application/json`)
 
 * `protocols => [graphql_ws | apollo]` - list of GraphQL-over-websocket protocols to accept;
   it will be negotiated via `Sec-WebSocket-Protocol` header. If no such header set, the first in
-  the list will be used
-* `json_mod => module()` same as in HTTP
-* `max_frame_size => pos_integer()` - maximum allowed size of single WebSocket request frame
+  the list will be used. Default: `[graphql_ws, apollo]`
+* `json_mod => module()` same as in HTTP. Default: [`jsx`](https://hex.pm/packages/jsx)
+* `max_frame_size => pos_integer()` (bytes) - maximum allowed size of single WebSocket request frame
+  Default: 5 MB
+* `heartbeat => pos_integer()` (milliseconds) - send WebSocket `ping` frames (not GraphQL sub-protocol
+  pings!) to the client periodically; there is no consequences currently if client does not reply
+  unless `idle_timeout` is set. Default: disabled
+* `idle_timeout => timeout()` (milliseconds) - close the WebSocket (and call
+  `terminate(timeout, ...)` callback) if no data was received from client in this many milliseconds.
+  Default: 10 minutes
+
+It is highly recommended to not set `idle_timeout` to infinity, but to set both `idle_timeout` and
+`heartbeat`. Makes sense to have `heartbeat` smaller than `idle_timeout`.
+
+GraphQL sub-protocol pings are answered automatically under the hood.

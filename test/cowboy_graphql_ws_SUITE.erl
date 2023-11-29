@@ -21,7 +21,9 @@
     connection_other_error_case/1,
     protocol_error_unordered_case/1,
     protocol_error_bad_json_syntax_case/1,
-    protocol_error_bad_json_case/1
+    protocol_error_bad_json_case/1,
+    heartbeat_case/1,
+    idle_timeout_case/1
 ]).
 
 -record(cli, {gun, proto}).
@@ -67,7 +69,14 @@ end_per_suite(Cfg) ->
     Cfg.
 
 init_per_testcase(Name, Cfg) ->
-    cowboy_graphql_mock:start(#{transports => [ws]}),
+    Opts =
+        try
+            ?MODULE:Name({transport_opts, Cfg})
+        catch
+            error:function_clause ->
+                #{}
+        end,
+    cowboy_graphql_mock:start(#{transports => [{ws, Opts}]}),
     ?MODULE:Name({pre, Cfg}).
 
 end_per_testcase(Name, Cfg) ->
@@ -365,6 +374,42 @@ protocol_error_bad_json_case(Cfg) when is_list(Cfg) ->
     end,
     close(Cli).
 
+%% @doc Make sure server sends `ping' packets when heartbeat is enabled
+heartbeat_case({transport_opts, _Cfg}) ->
+    #{heartbeat => 100};
+heartbeat_case({pre, Cfg}) ->
+    Cfg;
+heartbeat_case({post, Cfg}) ->
+    Cfg;
+heartbeat_case(Cfg) when is_list(Cfg) ->
+    Cli = #cli{gun = {Pid, Stream}} = client("/api/ok--/websocket", proto(Cfg)),
+    %% requires `silence_pings => false'
+    ?assertEqual({ws, ping}, ws_await(Pid, Stream)),
+    ?assertEqual({ws, ping}, ws_await(Pid, Stream)),
+    close(Cli),
+    ok = gun:flush(Pid),
+    ok.
+
+%% @doc Connection is automatically closed when `idle_timeout' is set
+idle_timeout_case({transport_opts, _Cfg}) ->
+    #{idle_timeout => 300};
+idle_timeout_case({pre, Cfg}) ->
+    Cfg;
+idle_timeout_case({post, Cfg}) ->
+    Cfg;
+idle_timeout_case(Cfg) when is_list(Cfg) ->
+    Cli = #cli{gun = {Pid, Stream}} = client("/api/ok--/websocket", proto(Cfg)),
+    %% Still possible to do requests
+    Payload = r(request(Cli, <<"echo">>, <<"graphql query">>, #{<<"k">> => <<"v">>})),
+    ?assertMatch(#{<<"data">> := #{<<"query">> := <<"graphql query">>}}, Payload),
+    %% It replies with `pong' to `ping's
+    ok = gun:ws_send(Pid, Stream, ping),
+    ?assertMatch({ws, pong}, ws_await(Pid, Stream)),
+    %% But then it times out
+    ?assertEqual({ws, {close, 1000, <<>>}}, ws_await(Pid, Stream)),
+    close(Cli),
+    ok.
+
 %%
 %% Test client
 %%
@@ -387,7 +432,10 @@ connect(Path, Protocol) ->
             apollo ->
                 <<"graphql-ws">>
         end,
-    WsStream1 = gun:ws_upgrade(Pid, Path, [], #{protocols => [{Proto, gun_ws_h}]}),
+    WsStream1 = gun:ws_upgrade(Pid, Path, [], #{
+        protocols => [{Proto, gun_ws_h}],
+        silence_pings => false
+    }),
     Stream =
         receive
             {gun_upgrade, Pid, WsStream1, [<<"websocket">>], _Hdrs} ->

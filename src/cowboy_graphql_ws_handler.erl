@@ -15,7 +15,7 @@
 -export([config/3]).
 -export([
     init/2,
-    %% websocket_init/1,
+    websocket_init/1,
     websocket_handle/2,
     websocket_info/2,
     terminate/3
@@ -36,6 +36,7 @@
     cb_state :: any(),
     protocol :: protocol(),
     stage = connected :: connected | handshake | active | terminated,
+    heartbeat :: timeout() | {reference(), pos_integer()} | undefined,
     json_encode :: fun((any()) -> iodata()),
     json_decode :: fun((binary()) -> any())
 }).
@@ -50,12 +51,13 @@
 -type options() :: #{
     json_mod => module(),
     max_frame_size => pos_integer(),
-    protocols => [protocol()]
+    protocols => [protocol()],
+    heartbeat => timeout(),
+    idle_timeout => pos_integer()
 }.
 -opaque config() :: {module(), any(), options()}.
 
 -type features() :: #{subprotocol => protocol()}.
-%% TODO: active keepalive
 
 %% @doc Creates a structure to be passed as `InitialState' to Cowboy's router.
 %% See [[https://ninenines.eu/docs/en/cowboy/2.9/manual/cowboy_router/]]
@@ -89,6 +91,8 @@ init(Req0, {Callback, CallbackOpts, Params0}) ->
                     cb = Callback,
                     cb_state = CbState,
                     protocol = ProtoTag,
+                    % store value for later use
+                    heartbeat = maps:get(heartbeat, Params, undefined),
                     json_encode = fun JsonMod:encode/1,
                     json_decode = fun JsonMod:decode/1
                 },
@@ -140,13 +144,13 @@ choose_protocol(Req0, [_ | _] = EnabledProtocols) ->
             {hd(EnabledProtocols), Req0};
         [Tag | _] ->
             HeaderVal = maps:get(Tag, ?SUPPORTED_PROTOCOLS),
-            %% Req = cowboy_req:set_resp_header(<<"Sec-WebSocket-Protocol">>, HeaderVal, Req0),
             Req = cowboy_req:set_resp_header(<<"sec-websocket-protocol">>, HeaderVal, Req0),
             {Tag, Req}
     end.
 
-%% websocket_init(#state{cb = Callback, cb_state = CbState} = St) ->
-%%     {ok, State}.
+websocket_init(#state{heartbeat = Heartbeat} = St) ->
+    Timer = heartbeat_init(Heartbeat),
+    {ok, St#state{heartbeat = Timer}}.
 
 websocket_handle({text, Text}, #state{protocol = Proto} = State) ->
     try json_decode(Text, State) of
@@ -175,9 +179,15 @@ websocket_handle({text, Text}, #state{protocol = Proto} = State) ->
             ),
             {encode_packets([to_error(Proto, Err)], State), State}
     end;
+websocket_handle(ping, #state{heartbeat = Hb0} = State) ->
+    {[], State#state{heartbeat = heartbeat_restart(Hb0)}};
+websocket_handle(pong, #state{} = State) ->
+    {[], State};
 websocket_handle(_Frame, State) ->
     {ok, State}.
 
+websocket_info({?MODULE, heartbeat}, #state{heartbeat = Hb0} = State) ->
+    {[ping], State#state{heartbeat = heartbeat_restart(Hb0)}};
 websocket_info(Any, #state{cb = Callback, cb_state = CallbackState0, protocol = Proto} = State) ->
     case cowboy_graphql:call_handle_info(Callback, Any, CallbackState0) of
         {noreply, CallbackState} ->
@@ -291,6 +301,8 @@ handle_message(
     };
 handle_message(#{<<"type">> := <<"ping">>}, active, graphql_ws, State) ->
     {[{json, #{<<"type">> => <<"pong">>}}], State};
+handle_message(#{<<"type">> := <<"pong">>}, active, graphql_ws, State) ->
+    {[], State};
 handle_message(
     #{
         <<"type">> := <<"subscribe">>,
@@ -503,3 +515,15 @@ json_decode(Json, #state{json_decode = Decode}) ->
 
 json_encode(Obj, #state{json_encode = Encode}) ->
     Encode(Obj).
+
+heartbeat_init(undefined) ->
+    undefined;
+heartbeat_init(Timeout) when is_integer(Timeout), Timeout > 0 ->
+    Ref = erlang:send_after(Timeout, self(), {?MODULE, heartbeat}),
+    {Ref, Timeout}.
+
+heartbeat_restart(undefined) ->
+    undefined;
+heartbeat_restart({Ref, Timeout}) ->
+    erlang:cancel_timer(Ref),
+    heartbeat_init(Timeout).
