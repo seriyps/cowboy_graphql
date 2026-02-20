@@ -171,7 +171,12 @@ start() ->
           max_connections => 1024,
           socket_opts => [{port, 8080}]
       },
-      #{env => #{dispatch => Dispatch}}
+      #{
+          env => #{dispatch => Dispatch},
+          %% Required for long-poll HTTP subscriptions; see note under `timeout` option below.
+          idle_timeout => 10 * 60 * 1000,
+          inactivity_timeout => 10 * 60 * 1000
+      }
   ).
 
 ```
@@ -198,6 +203,30 @@ start() ->
 
 Both `heartbeat` and `timeout` timers are only started after `handle_call` callback returns `noreply`.
 So the timeout is "soft". If your `handle_call` is slow, it won't be interrupted.
+
+> **Warning for long-poll subscriptions (`json` response type):** the `timeout` option runs in the
+> handler process, but Cowboy has two separate connection-level timeouts that must also be configured:
+>
+> * `idle_timeout` (default 60s) — Cowboy closes the connection if no socket data is received for
+>   this long. Must be set higher than `timeout`.
+> * `inactivity_timeout` (default 300s) — Cowboy closes the connection if the *connection process*
+>   receives no messages for this long. The cowboy_loop handler runs in a **separate process**
+>   (spawned by `cowboy_stream_h`), so it cannot reset this timer. If `inactivity_timeout` equals
+>   `timeout`, there is a race where the connection is killed before the handler can send its
+>   response. Must be set higher than `timeout`.
+>
+> Example: if `timeout => 5 * 60 * 1000`, set both Cowboy options to at least `10 * 60 * 1000`:
+>
+> ```erlang
+> cowboy:start_clear(listener, TransportOpts, #{
+>     env => #{dispatch => Dispatch},
+>     idle_timeout => 10 * 60 * 1000,
+>     inactivity_timeout => 10 * 60 * 1000
+> })
+> ```
+>
+> These options are not needed for `multipart` streaming (heartbeats keep the connection alive)
+> or for WebSocket transport (which has its own `idle_timeout` option above).
 
 For `accept_body` and `response_types` if no `Content-Type`/`Accept` header provided in the request,
 the first element of the list from the option will be used. Eg, if `response_types => [json, multipart]`
